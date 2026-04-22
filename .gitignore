@@ -1,0 +1,17 @@
+# Node
+node_modules/
+*.zip
+
+# Dist
+dist/
+
+# Terraform
+terraform/.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Environment
+.env
+.env.local
