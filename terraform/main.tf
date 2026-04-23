@@ -23,6 +23,7 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
+# ← VUELVE el módulo dynamodb
 module "dynamodb" {
   source = "./modules/dynamodb"
   stage  = var.stage
@@ -38,8 +39,8 @@ module "lambdas" {
   stage                     = var.stage
   account_id                = data.aws_caller_identity.current.account_id
   aws_region                = var.aws_region
-  payment_table_name        = module.dynamodb.payment_table_name
-  payment_table_arn         = module.dynamodb.payment_table_arn
+  payment_table_name        = module.dynamodb.payment_table_name  # ← viene del módulo
+  payment_table_arn         = module.dynamodb.payment_table_arn   # ← viene del módulo
   start_payment_queue_arn   = module.sqs.start_payment_queue_arn
   start_payment_queue_url   = module.sqs.start_payment_queue_url
   check_balance_queue_arn   = module.sqs.check_balance_queue_arn
@@ -47,28 +48,7 @@ module "lambdas" {
   transaction_queue_arn     = module.sqs.transaction_queue_arn
   transaction_queue_url     = module.sqs.transaction_queue_url
   card_service_url          = var.card_service_url
-  redis_host                = var.redis_host
-  redis_port                = var.redis_port
   lambda_s3_bucket          = var.lambda_s3_bucket
-  vpc_subnet_ids            = var.vpc_subnet_ids      
+  vpc_subnet_ids            = var.vpc_subnet_ids
   vpc_security_group_ids    = var.vpc_security_group_ids
-}
-
-module "api_gateway" {
-  source                        = "./modules/api_gateway"
-  stage                         = var.stage
-  payment_lambda_arn            = module.lambdas.payment_lambda_arn
-  payment_lambda_name           = module.lambdas.payment_lambda_name
-  catalog_lambda_arn            = module.lambdas.catalog_lambda_arn
-  catalog_lambda_name           = module.lambdas.catalog_lambda_name
-}
-
-variable "vpc_subnet_ids" {
-  description = "Subnet IDs from the Redis VPC"
-  type        = list(string)
-}
-
-variable "vpc_security_group_ids" {
-  description = "Security group IDs for Lambda VPC access"
-  type        = list(string)
 }

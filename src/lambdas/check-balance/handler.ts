@@ -1,75 +1,119 @@
 import { SQSEvent, SQSRecord, SQSBatchResponse, SQSBatchItemFailure } from 'aws-lambda';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
-import { PaymentRepository } from '../../shared/db/payment.repository';
-import { CardRepository } from '../../shared/db/card.repository';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 
-const paymentRepository = new PaymentRepository();
-const cardRepository = new CardRepository();
 const sqs = new SQSClient({ region: process.env.AWS_REGION ?? 'us-east-1' });
+const dynamoDb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION ?? 'us-east-1' })
+);
+
 const TRANSACTION_QUEUE_URL = process.env.TRANSACTION_QUEUE_URL ?? '';
-const DELAY_MS = 5000;
+const PAYMENT_TABLE_NAME    = process.env.PAYMENT_TABLE_NAME ?? 'payment-table-dev';
+const CARD_TABLE_NAME       = process.env.CARD_TABLE_NAME ?? 'card-table-dev';
+const DELAY_MS              = 5000;
 
 export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
-    const batchItemFailures: SQSBatchItemFailure[] = [];
+  console.log('Event received:', JSON.stringify(event));
+  const batchItemFailures: SQSBatchItemFailure[] = [];
 
-    for (const record of event.Records) {
-        try {
-            await processRecord(record);
-        } catch (error) {
-            console.error(`Failed to process message ${record.messageId}:`, error);
-            batchItemFailures.push({ itemIdentifier: record.messageId });
-        }
+  for (const record of event.Records) {
+    try {
+      await processRecord(record);
+    } catch (error) {
+      console.error(`Failed to process message ${record.messageId}:`, error);
+      batchItemFailures.push({ itemIdentifier: record.messageId });
     }
+  }
 
-    return { batchItemFailures };
+  return { batchItemFailures };
 };
 
 async function processRecord(record: SQSRecord): Promise<void> {
-    const { traceId } = JSON.parse(record.body);
+  const { traceId } = JSON.parse(record.body);
 
-    console.log(`check-balance — traceId: ${traceId}`);
+  console.log(`check-balance — traceId: ${traceId}`);
 
-    // 1. Simular delay de 5 segundos
-    await delay(DELAY_MS);
+  // 1. Delay de 5 segundos
+  await delay(DELAY_MS);
 
-    // 2. Buscar el payment
-    const payment = await paymentRepository.findByTraceId(traceId);
+  // 2. Buscar payment
+  const paymentResult = await dynamoDb.send(new GetCommand({
+    TableName: PAYMENT_TABLE_NAME,
+    Key:       { traceId },
+  }));
 
-    if (!payment) {
-        throw new Error(`Payment not found for traceId: ${traceId}`);
-    }
+  const payment = paymentResult.Item;
 
-    // 3. Buscar la tarjeta y verificar saldo
-    const card = await cardRepository.findByUuid(payment.cardId);
+  if (!payment) {
+    throw new Error(`Payment not found for traceId: ${traceId}`);
+  }
 
-    if (!card) {
-        await paymentRepository.updateStatus(traceId, 'FAILED', 'Card not found');
-        console.error(`check-balance FAILED — card not found, traceId: ${traceId}`);
-        return;
-    }
+  console.log(`Payment found — cardId: ${payment.cardId}`);
 
-    const requiredAmount = payment.service.precio_mensual;
+  // 3. Buscar tarjeta
+  const cardResult = await dynamoDb.send(new QueryCommand({
+    TableName:                 CARD_TABLE_NAME,
+    KeyConditionExpression:    '#uuid = :uuid',
+    ExpressionAttributeNames:  { '#uuid': 'uuid' },
+    ExpressionAttributeValues: { ':uuid': payment.cardId },
+    Limit:                     1,
+    ScanIndexForward:          false,
+  }));
 
-    if (card.balance < requiredAmount) {
-        await paymentRepository.updateStatus(
-            traceId,
-            'FAILED',
-            'La cuenta no tiene saldo disponible',
-        );
-        console.error(`check-balance FAILED — insufficient balance, traceId: ${traceId}`);
-        return;
-    }
+  const card = cardResult.Items?.[0];
 
-    // 4. Saldo suficiente → actualizar status a IN_PROGRESS
-    await paymentRepository.updateStatus(traceId, 'IN_PROGRESS');
+  if (!card) {
+    await updateStatus(traceId, 'FAILED', 'Tarjeta no encontrada');
+    console.error(`check-balance FAILED — card not found`);
+    return;
+  }
 
-    console.log(`check-balance complete — traceId: ${traceId}, status: IN_PROGRESS`);
+  console.log(`Card found — balance: ${card.balance}, required: ${payment.service.precio_mensual}`);
 
-    // 5. Enviar traceId a transaction-sqs
-    await sqs.send(new SendMessageCommand({
-        QueueUrl: TRANSACTION_QUEUE_URL,
-        MessageBody: JSON.stringify({ traceId }),
-    }));
+  // 4. Verificar saldo
+  if (card.balance < payment.service.precio_mensual) {
+    await updateStatus(traceId, 'FAILED', 'La cuenta no tiene saldo disponible');
+    console.error(`check-balance FAILED — insufficient balance`);
+    return;
+  }
+
+  // 5. Actualizar status a IN_PROGRESS
+  await updateStatus(traceId, 'IN_PROGRESS');
+  console.log(`✅ check-balance complete — status: IN_PROGRESS`);
+
+  // 6. Enviar a transaction-sqs
+  await sqs.send(new SendMessageCommand({
+    QueueUrl:    TRANSACTION_QUEUE_URL,
+    MessageBody: JSON.stringify({ traceId }),
+  }));
+
+  console.log(`✅ Sent to transaction-sqs — traceId: ${traceId}`);
+}
+
+async function updateStatus(traceId: string, status: string, error?: string): Promise<void> {
+  const updateExpression = error
+    ? 'SET #status = :status, #error = :error, #timestamp = :timestamp'
+    : 'SET #status = :status, #timestamp = :timestamp';
+
+  const expressionAttributeValues: Record<string, any> = {
+    ':status':    status,
+    ':timestamp': Date.now().toString(),
+  };
+
+  if (error) expressionAttributeValues[':error'] = error;
+
+  await dynamoDb.send(new UpdateCommand({
+    TableName:                 PAYMENT_TABLE_NAME,
+    Key:                       { traceId },
+    UpdateExpression:          updateExpression,
+    ExpressionAttributeNames:  {
+      '#status':    'status',
+      '#timestamp': 'timestamp',
+      ...(error ? { '#error': 'error' } : {}),
+    },
+    ExpressionAttributeValues: expressionAttributeValues,
+  }));
 }
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

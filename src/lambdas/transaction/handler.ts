@@ -1,90 +1,132 @@
 import { SQSEvent, SQSRecord, SQSBatchResponse, SQSBatchItemFailure } from 'aws-lambda';
-import { PaymentRepository } from '../../shared/db/payment.repository';
-import { CardRepository } from '../../shared/db/card.repository';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 
-const paymentRepository = new PaymentRepository();
-const cardRepository = new CardRepository();
-const DELAY_MS = 5000;
-const CARD_SERVICE_URL = process.env.CARD_SERVICE_URL ?? '';
+const dynamoDb = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION ?? 'us-east-1' })
+);
+
+const PAYMENT_TABLE_NAME = process.env.PAYMENT_TABLE_NAME ?? 'payment-table-dev';
+const CARD_TABLE_NAME    = process.env.CARD_TABLE_NAME ?? 'card-table-dev';
+const CARD_SERVICE_URL   = process.env.CARD_SERVICE_URL ?? '';
+const DELAY_MS           = 5000;
 
 export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
-    const batchItemFailures: SQSBatchItemFailure[] = [];
+  console.log('Event received:', JSON.stringify(event));
+  const batchItemFailures: SQSBatchItemFailure[] = [];
 
-    for (const record of event.Records) {
-        try {
-            await processRecord(record);
-        } catch (error) {
-            console.error(`Failed to process message ${record.messageId}:`, error);
-            batchItemFailures.push({ itemIdentifier: record.messageId });
-        }
+  for (const record of event.Records) {
+    try {
+      await processRecord(record);
+    } catch (error) {
+      console.error(`Failed to process message ${record.messageId}:`, error);
+      batchItemFailures.push({ itemIdentifier: record.messageId });
     }
+  }
 
-    return { batchItemFailures };
+  return { batchItemFailures };
 };
 
 async function processRecord(record: SQSRecord): Promise<void> {
-    const { traceId } = JSON.parse(record.body);
+  const { traceId } = JSON.parse(record.body);
 
-    console.log(`transaction — traceId: ${traceId}`);
+  console.log(`transaction — traceId: ${traceId}`);
 
-    // 1. Simular delay de 5 segundos
-    await delay(DELAY_MS);
+  // 1. Delay de 5 segundos
+  await delay(DELAY_MS);
 
-    // 2. Buscar el payment
-    const payment = await paymentRepository.findByTraceId(traceId);
+  // 2. Buscar payment
+  const paymentResult = await dynamoDb.send(new GetCommand({
+    TableName: PAYMENT_TABLE_NAME,
+    Key:       { traceId },
+  }));
 
-    if (!payment) {
-        throw new Error(`Payment not found for traceId: ${traceId}`);
-    }
+  const payment = paymentResult.Item;
 
-    // 3. Buscar la tarjeta para verificar saldo actualizado
-    const card = await cardRepository.findByUuid(payment.cardId);
+  if (!payment) {
+    throw new Error(`Payment not found for traceId: ${traceId}`);
+  }
 
-    if (!card) {
-        await paymentRepository.updateStatus(traceId, 'FAILED', 'Card not found');
-        return;
-    }
+  // 3. Buscar tarjeta
+  const cardResult = await dynamoDb.send(new QueryCommand({
+    TableName:                 CARD_TABLE_NAME,
+    KeyConditionExpression:    '#uuid = :uuid',
+    ExpressionAttributeNames:  { '#uuid': 'uuid' },
+    ExpressionAttributeValues: { ':uuid': payment.cardId },
+    Limit:                     1,
+    ScanIndexForward:          false,
+  }));
 
-    const amount = payment.service.precio_mensual;
+  const card = cardResult.Items?.[0];
 
-    // 4. Verificar saldo una vez más (doble validación)
-    if (card.balance < amount) {
-        await paymentRepository.updateStatus(
-            traceId,
-            'FAILED',
-            'La cuenta no tiene saldo disponible',
-        );
-        return;
-    }
+  if (!card) {
+    await updateStatus(traceId, 'FAILED', 'Tarjeta no encontrada');
+    return;
+  }
 
-    // 5. Descontar saldo de la tarjeta
-    const newBalance = card.balance - amount;
-    await cardRepository.updateBalance(card.uuid, card.createdAt, newBalance);
+  const amount = payment.service.precio_mensual;
 
-    // 6. Registrar transacción en el card-service via POST /transactions/purchase
-    try {
-        const purchaseResponse = await fetch(`${CARD_SERVICE_URL}/transactions/purchase`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                merchant: `${payment.service.proveedor} - ${payment.service.servicio}`,
-                cardId: payment.cardId,
-                amount,
-            }),
-        });
+  // 4. Doble validación de saldo
+  if (card.balance < amount) {
+    await updateStatus(traceId, 'FAILED', 'La cuenta no tiene saldo disponible');
+    return;
+  }
 
-        if (!purchaseResponse.ok) {
-            console.warn(`card-service purchase registration failed — traceId: ${traceId}`);
-        }
-    } catch (error) {
-        // No fallamos el pago si el registro en card-service falla
-        console.warn(`Error calling card-service — traceId: ${traceId}`, error);
-    }
+  // 5. Descontar saldo
+  const newBalance = card.balance - amount;
+  await dynamoDb.send(new UpdateCommand({
+    TableName:                 CARD_TABLE_NAME,
+    Key:                       { uuid: card.uuid, createdAt: card.createdAt },
+    UpdateExpression:          'SET balance = :balance',
+    ExpressionAttributeValues: { ':balance': newBalance },
+  }));
 
-    // 7. Actualizar status a FINISH
-    await paymentRepository.updateStatus(traceId, 'FINISH');
+  console.log(`✅ Balance updated — old: ${card.balance}, new: ${newBalance}`);
 
-    console.log(`transaction complete — traceId: ${traceId}, status: FINISH, amount: ${amount}`);
+  // 6. Llamar a card-service POST /transactions/purchase
+  try {
+    const res = await fetch(`${CARD_SERVICE_URL}/transactions/purchase`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        merchant: `${payment.service.proveedor} - ${payment.service.servicio}`,
+        cardId:   payment.cardId,
+        amount,
+      }),
+    });
+    console.log(`card-service response: ${res.status}`);
+  } catch (error) {
+    console.warn(`Error calling card-service:`, error);
+  }
+
+  // 7. Actualizar status a FINISH
+  await updateStatus(traceId, 'FINISH');
+  console.log(`✅ transaction complete — traceId: ${traceId}, status: FINISH`);
+}
+
+async function updateStatus(traceId: string, status: string, error?: string): Promise<void> {
+  const updateExpression = error
+    ? 'SET #status = :status, #error = :error, #timestamp = :timestamp'
+    : 'SET #status = :status, #timestamp = :timestamp';
+
+  const expressionAttributeValues: Record<string, any> = {
+    ':status':    status,
+    ':timestamp': Date.now().toString(),
+  };
+
+  if (error) expressionAttributeValues[':error'] = error;
+
+  await dynamoDb.send(new UpdateCommand({
+    TableName:                 PAYMENT_TABLE_NAME,
+    Key:                       { traceId },
+    UpdateExpression:          updateExpression,
+    ExpressionAttributeNames:  {
+      '#status':    'status',
+      '#timestamp': 'timestamp',
+      ...(error ? { '#error': 'error' } : {}),
+    },
+    ExpressionAttributeValues: expressionAttributeValues,
+  }));
 }
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
